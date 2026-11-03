@@ -3,7 +3,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import { GoogleGenAI } from '@google/genai';
 
-const MODELO = 'gemini-2.5-flash';
+const MODELO = 'gemini-3.8-flash';
 
 const DOMINIOS = [
   'corteconstitucional.gov.co',
@@ -14,9 +14,11 @@ const DOMINIOS = [
 
 function obtenerCliente() {
   const apiKey = process.env.GEMINI_API_KEY;
+
   if (!apiKey) {
     throw new Error('Falta configurar GEMINI_API_KEY en Render.');
   }
+
   return new GoogleGenAI({ apiKey });
 }
 
@@ -41,24 +43,62 @@ function extraerJSON(texto) {
 function esDominioOficial(url) {
   try {
     const host = new URL(url).hostname.toLowerCase();
-    return DOMINIOS.some(d => host === d || host.endsWith('.' + d));
+
+    return DOMINIOS.some(d =>
+      host === d || host.endsWith('.' + d)
+    );
   } catch {
     return false;
   }
+}
+
+function obtenerFuentes(interaccion) {
+  const fuentes = [];
+
+  for (const paso of interaccion.steps || []) {
+    if (paso.type !== 'model_output') continue;
+
+    for (const bloque of paso.content || []) {
+      if (bloque.type !== 'text') continue;
+
+      for (const anotacion of bloque.annotations || []) {
+        if (
+          anotacion.type === 'url_citation' &&
+          anotacion.url &&
+          esDominioOficial(anotacion.url)
+        ) {
+          fuentes.push({
+            url: anotacion.url,
+            titulo: anotacion.title || 'Fuente oficial'
+          });
+        }
+      }
+    }
+  }
+
+  return fuentes;
 }
 
 // ETAPA 1: analizar y resumir el caso.
 async function ficha(caso) {
   const ai = obtenerCliente();
 
-  const respuesta = await ai.models.generateContent({
+  const respuesta = await ai.interactions.create({
     model: MODELO,
-    contents: `Eres un asistente jurídico colombiano.
+    store: false,
+    input: `Eres un asistente jurídico colombiano.
+
 Lee el CASO y responde SOLO un JSON válido con:
-hechos[], problema (problema jurídico), conceptos[],
+
+hechos[],
+problema (problema jurídico),
+conceptos[],
 sinonimos[{termino,equivalentes[]}],
-polisemia[{termino,sentidos}], normas[], pruebas[],
-argumentos[], area (rama del derecho),
+polisemia[{termino,sentidos}],
+normas[],
+pruebas[],
+argumentos[],
+area (rama del derecho),
 consultas[4 búsquedas cortas para relatorías],
 resumen_busqueda (máximo 150 palabras con lo esencial para buscar jurisprudencia).
 
@@ -66,28 +106,23 @@ No inventes datos que no estén en el caso.
 No escribas explicaciones fuera del JSON.
 
 CASO:
-${caso.slice(0, 120000)}`,
-    config: {
-      maxOutputTokens: 2500,
-      temperature: 0.2
-    }
+${caso.slice(0, 120000)}`
   });
 
-  return extraerJSON(respuesta.text);
+  return extraerJSON(respuesta.output_text);
 }
 
-// ETAPA 2: búsqueda web de jurisprudencia.
+// ETAPA 2: búsqueda de jurisprudencia.
 async function buscar(f) {
   const ai = obtenerCliente();
 
   const prompt = `Busca jurisprudencia colombiana REAL relacionada con este caso.
 
-Debes buscar en fuentes oficiales de las altas cortes colombianas.
-Prioriza estos dominios:
-${DOMINIOS.join(', ')}
-
 Busca por significado jurídico, hechos, problemas y normas,
 no solamente por palabras idénticas.
+
+Prioriza exclusivamente fuentes oficiales de estas altas cortes:
+${DOMINIOS.join(', ')}
 
 FICHA DEL CASO:
 ${JSON.stringify({
@@ -99,7 +134,8 @@ ${JSON.stringify({
   resumen: f.resumen_busqueda
 })}
 
-Devuelve SOLO un JSON válido con esta estructura:
+Responde SOLO un JSON válido con esta estructura:
+
 {
   "resultados": [
     {
@@ -126,45 +162,34 @@ Devuelve SOLO un JSON válido con esta estructura:
   ]
 }
 
-REGLAS OBLIGATORIAS:
+REGLAS:
 - Devuelve entre 3 y 8 sentencias si encuentras suficientes.
 - No inventes sentencias, radicados, ponentes, fechas ni enlaces.
-- Cada URL debe pertenecer a uno de los dominios oficiales indicados.
-- Usa enlaces de documentos o fichas oficiales que hayas encontrado.
+- Cada sentencia debe tener una fuente oficial verificable.
 - Si un dato no aparece, escribe "No consta".
-- Los porcentajes de similitud son estimaciones razonadas, no mediciones oficiales.
-- Si no encuentras sentencias verificables, devuelve resultados vacío.
-- No confundas noticias o artículos con sentencias judiciales.`;
+- Los porcentajes de similitud son estimaciones razonadas.
+- No confundas noticias o artículos con sentencias.
+- Si no encuentras sentencias verificables, devuelve resultados vacío.`;
 
-  const respuesta = await ai.models.generateContent({
+  const respuesta = await ai.interactions.create({
     model: MODELO,
-    contents: prompt,
-    config: {
-      maxOutputTokens: 6000,
-      temperature: 0.2,
-      tools: [{ googleSearch: {} }]
-    }
+    store: false,
+    input: prompt,
+    tools: [{ type: 'google_search' }]
   });
 
-  const datos = extraerJSON(respuesta.text);
+  const datos = extraerJSON(respuesta.output_text);
+  const fuentes = obtenerFuentes(respuesta);
 
-  // Comprobar que los enlaces sean oficiales y aparezcan
-  // entre las fuentes devueltas por la búsqueda de Google.
-  const candidatos = respuesta.candidates || [];
-  const metadatos = candidatos[0]?.groundingMetadata;
-  const fuentes = metadatos?.groundingChunks || [];
-
-  const urlsEncontradas = new Set(
-    fuentes
-      .map(fuente => fuente.web?.uri)
-      .filter(url => url && esDominioOficial(url))
+  const urlsOficiales = new Set(
+    fuentes.map(f => f.url)
   );
 
   const resultados = (datos.resultados || [])
     .filter(item =>
       item.url &&
       esDominioOficial(item.url) &&
-      urlsEncontradas.has(item.url)
+      urlsOficiales.has(item.url)
     )
     .slice(0, 8);
 
@@ -179,6 +204,7 @@ http.createServer(async (req, res) => {
     try {
       for await (const c of req) {
         body += c;
+
         if (body.length > 15_000_000) {
           throw new Error('El documento es demasiado grande.');
         }
@@ -187,7 +213,9 @@ http.createServer(async (req, res) => {
       const { caso } = JSON.parse(body);
 
       if (!caso || caso.trim().length < 30) {
-        throw new Error('Escribe un caso más detallado o sube un documento.');
+        throw new Error(
+          'Escribe un caso más detallado o sube un documento.'
+        );
       }
 
       const f = await ficha(caso);
@@ -209,7 +237,9 @@ http.createServer(async (req, res) => {
         'Content-Type': 'application/json; charset=utf-8'
       });
 
-      res.end(JSON.stringify({ error: e.message }));
+      res.end(JSON.stringify({
+        error: e.message
+      }));
     }
 
     return;
@@ -220,7 +250,9 @@ http.createServer(async (req, res) => {
   });
 
   res.end(
-    fs.readFileSync(new URL('./public/index.html', import.meta.url))
+    fs.readFileSync(
+      new URL('./public/index.html', import.meta.url)
+    )
   );
 
 }).listen(process.env.PORT || 3000, () => {
