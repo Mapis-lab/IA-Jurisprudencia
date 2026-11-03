@@ -1,1 +1,12 @@
-{"name":"busqueda-jurisprudencia","version":"1.0.0","type":"module","scripts":{"start":"node server.js"},"dependencies":{"@anthropic-ai/sdk":"^0.40.0"}}
+
+{
+  "name": "busqueda-jurisprudencia",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0"
+  }
+}
